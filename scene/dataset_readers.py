@@ -11,8 +11,6 @@
 
 import os
 import sys
-import open3d as o3d
-import open3d.cpu.pybind.io
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -36,7 +34,6 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
-    device_id: str
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -95,18 +92,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-            print("Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!")
-            #assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, device_id='')
+                              image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -262,44 +255,48 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     return scene_info
 
 
-def readCameraArrayInfo(camera_path, pc_path, height=1080, width=1920, image_dict={}):
-    with open(os.path.join(camera_path, 'camera_info.json'), 'r') as f:
-        camera_array_info = json.load(f)
-    cam_infos = []
-    uid = 0
+def readCameraArrayInfo(json_path, ply_path, white_background, eval, extension=".png"):
+    print("Reading Training Transforms")
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    print("Reading Test Transforms")
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
 
-    for device_id in camera_array_info:
-        camera_intrinsic = camera_array_info[device_id]['intrinsic']
-        camera_extrinsic = camera_array_info[device_id]['extrinsic']
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
 
-        focal_length_x = camera_intrinsic[0, 0]
-        focal_length_y = camera_intrinsic[1, 1]
-        FovY = focal2fov(focal_length_y, height)
-        FovX = focal2fov(focal_length_x, width)
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+        train_cam_infos = data
+        test_cam_infos = data
 
-        image_path = image_dict[device_id]['image_path']
-        image_name = image_dict[device_id]['image_name']
-        image = Image.open(image_path)
-
-        cam_info = CameraInfo(uid=uid, R=camera_extrinsic[0:3, 0:3], T=camera_extrinsic[0:3, 3],
-                              FovY=FovY, FovX=FovX, width=width, height=height, device_id=device_id,
-                              image=image, image_path=image_path, image_name=image_name)
-        cam_infos.append(cam_info)
-        uid += 1
-
-    train_cam_infos = cam_infos
-    test_cam_infos = cam_infos
     nerf_normalization = getNerfppNorm(train_cam_infos)
-    pcd = fetchPly(pc_path)
+
+    #ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=pc_path)
+                           ply_path=ply_path)
     return scene_info
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender": readNerfSyntheticInfo,
-    "CameraArray": readCameraArrayInfo,
+    "Blender" : readNerfSyntheticInfo
 }
